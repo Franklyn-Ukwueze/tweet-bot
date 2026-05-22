@@ -20,8 +20,6 @@ services:
           type: redis
           property: connectionString
 
-databases:
   - type: redis
     name: twitter-bot-redis
     plan: free
-    maxmemoryPolicy: allkeys-lru
