@@ -1,0 +1,27 @@
+services:
+  - type: worker
+    name: twitter-telegram-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: RAPIDAPI_KEY
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false
+      - key: POLL_INTERVAL_SECONDS
+        value: "300"
+      - key: REDIS_URL
+        fromService:
+          name: twitter-bot-redis
+          type: redis
+          property: connectionString
+
+databases:
+  - type: redis
+    name: twitter-bot-redis
+    plan: free
+    maxmemoryPolicy: allkeys-lru
