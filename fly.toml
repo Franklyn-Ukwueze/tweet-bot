@@ -1,0 +1,18 @@
+# fly.toml
+# Replace "your-app-name" with your actual app name (must be globally unique on Fly.io)
+
+app = "BeerusTweetBot"
+primary_region = "lhr"  # London — change to your nearest region if preferred
+                         # Other options: iad (Virginia), sin (Singapore), syd (Sydney)
+                         # nrt (Tokyo), fra (Frankfurt), cdg (Paris)
+
+[build]
+
+[env]
+  POLL_INTERVAL_SECONDS = "300"
+
+# This is a worker — no HTTP server, so no [[services]] block needed
+# Fly.io will keep it running as a persistent process
+
+[deploy]
+  strategy = "immediate"

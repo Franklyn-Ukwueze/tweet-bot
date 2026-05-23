@@ -1,5 +1,6 @@
 """
 Configuration — reads from environment variables.
+Secrets are set via: fly secrets set KEY=value
 """
 
 import os
@@ -31,11 +32,9 @@ class Config:
         self.rapidapi_tweets_url: str  = "https://twitter-api47.p.rapidapi.com/v3/user/tweets"
         self.rapidapi_profile_url: str = "https://twitter-api47.p.rapidapi.com/v3/user/by-username"
 
-        # Render injects REDIS_URL automatically via the Blueprint Redis service
+        # Fly.io Upstash Redis injects REDIS_URL with rediss:// (TLS)
         self.redis_url: str = (
             os.getenv("REDIS_URL")
-            or os.getenv("REDIS_TLS_URL")
-            or os.getenv("REDISCLOUD_URL")
             or "redis://localhost:6379"
         )
 

@@ -1,147 +1,171 @@
-# Twitter → Telegram Monitor Bot — Multi-Channel Edition
+# Twitter → Telegram Monitor Bot — Fly.io Edition
 
-One bot instance, any number of Telegram channels. Each channel has its own independent list of tracked Twitter/X accounts. Only original tweets and quote tweets are forwarded — pure reposts are silently skipped.
-
----
-
-## How It Works
-
-- Add the bot as Admin to as many channels as you like
-- Run `/add @username` **inside each channel** to track accounts per-channel
-- The bot polls Twitter every 5 minutes and posts new tweets only to the relevant channel
-- All state is stored in Redis — survives redeployments
+One bot, any number of Telegram channels. Each channel has its own independent list of tracked Twitter/X accounts. Original tweets and quote tweets only — reposts skipped.
 
 ---
 
-## Setup
+## Deploy to Fly.io (free tier)
 
-### 1 — Create a Telegram Bot
+### Prerequisites
 
-1. Message **@BotFather** → `/newbot` → copy the **token**
+Install the Fly CLI:
+```bash
+# macOS
+brew install flyctl
+
+# Linux
+curl -L https://fly.io/install.sh | sh
+
+# Windows
+pwsh -Command "iwr https://fly.io/install.ps1 -useb | iex"
+```
+
+Then log in:
+```bash
+fly auth login
+```
+
+---
+
+### Step 1 — Get your API keys
+
+**Telegram bot:**
+1. Message **@BotFather** → `/newbot` → copy the token
 2. Add the bot as **Administrator** to every channel you want to monitor (needs "Post Messages" permission)
-3. **Important:** in BotFather, run `/setprivacy` → select your bot → choose **Disable** so the bot can read commands sent in groups/channels
 
-### 2 — Get a RapidAPI Key
+**RapidAPI:**
+1. Sign up at https://rapidapi.com
+2. Search **"Tweet API"** by **twitter-api47** → subscribe to the free plan
+3. Copy your RapidAPI key
 
-1. Sign up free at https://rapidapi.com
-2. Search **"Twitter API v2"** by **twitter-api45** → subscribe to the free plan
-3. Copy your **RapidAPI Key**
-
-### 3 — Deploy to Render via Blueprint
-
-1. Push this folder to a new GitHub repo
-2. Render dashboard → **New → Blueprint** → connect the repo
-3. Render reads `render.yaml` and provisions the bot worker + Redis together
-4. Fill in the environment variables (Step 4) → **Apply**
-
-### 4 — Environment Variables
-
-Set these in the Blueprint setup screen or Render → your service → **Environment**:
-
-| Variable | Required | Description |
-|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | ✅ | From @BotFather |
-| `RAPIDAPI_KEY` | ✅ | From rapidapi.com |
-| `ADMIN_USER_IDS` | recommended | Comma-separated Telegram user IDs who can use commands |
-| `POLL_INTERVAL_SECONDS` | ❌ | Default `300` (5 min). Already set in render.yaml |
-| `REDIS_URL` | auto | Injected automatically — do not set manually |
-
-> **No `TELEGRAM_CHANNEL_ID` needed** — the bot is multi-channel and discovers channels automatically when you run commands inside them.
+**Your Telegram user ID** (to restrict bot commands to yourself):
+- Message **@userinfobot** on Telegram → copy the number
 
 ---
 
-## Usage
+### Step 2 — Create the Fly app
 
-### From inside a channel or group
-Just run commands directly — the bot knows which channel it's in:
-
-```
-/add @naval @sama          → track these accounts in this channel
-/remove @naval             → stop tracking in this channel
-/list                      → show accounts tracked in this channel
-/check                     → force an immediate tweet check for this channel
-/status                    → show stats for this channel
+```bash
+# From inside the project folder:
+fly launch --no-deploy
 ```
 
-### From a private chat with the bot
-Prefix commands with the channel ID to manage any channel remotely:
+When prompted:
+- **App name:** choose a unique name (this goes in fly.toml too — update it)
+- **Region:** pick your nearest one
+- **Postgres / Redis:** say **No** to both (we add Redis separately below)
 
-```
-/add -1001234567890 @naval
-/remove -1001234567890 @naval
-/list -1001234567890
-/check -1001234567890
-/status -1001234567890
-/list                      → (no ID) lists ALL channels and their accounts
-/status                    → (no ID) shows global stats across all channels
-/leave -1001234567890      → removes all tracking data for that channel
-```
-
-> Get a channel's numeric ID by forwarding a message from it to **@userinfobot**.
+Then edit `fly.toml` and replace `"your-app-name"` with the name you just chose.
 
 ---
 
-## Bot Commands Reference
+### Step 3 — Add Redis (Upstash, free tier)
+
+```bash
+fly ext upstash redis create
+```
+
+- Choose a name for the Redis instance
+- Select the same region as your app
+- Fly automatically sets `REDIS_URL` as a secret in your app — no manual steps needed
+
+---
+
+### Step 4 — Set secrets
+
+```bash
+fly secrets set \
+  TELEGRAM_BOT_TOKEN="123456789:ABCdef..." \
+  RAPIDAPI_KEY="your_rapidapi_key_here" \
+  ADMIN_USER_IDS="your_telegram_user_id"
+```
+
+---
+
+### Step 5 — Deploy
+
+```bash
+fly deploy
+```
+
+Check it's running:
+```bash
+fly logs        # live log stream
+fly status      # machine status
+```
+
+---
+
+## Managing the bot
+
+### Start tracking accounts
+
+Message your bot privately or run commands inside a channel:
+
+```
+/add @naval @sama @paulg
+```
+
+### From a private chat (manage any channel remotely)
+
+```
+/add -1001234567890 @naval     ← prefix with numeric channel ID
+/list                          ← lists ALL channels and their accounts
+/status                        ← global stats
+/leave -1001234567890          ← remove all data for a channel
+```
+
+Get a channel's numeric ID by forwarding any message from it to **@userinfobot**.
+
+---
+
+## Bot Commands
 
 | Command | Description |
 |---|---|
-| `/add [@username...]` | Track one or more Twitter accounts in this channel |
-| `/remove [@username...]` | Stop tracking accounts in this channel |
-| `/list` | Show tracked accounts (all channels if sent privately) |
-| `/check` | Trigger an immediate poll right now |
-| `/status` | Show stats (global if sent privately) |
-| `/leave` | Remove all tracking data for a channel (cleanup) |
+| `/add @username` | Track a Twitter account in this channel |
+| `/remove @username` | Stop tracking |
+| `/list` | Show tracked accounts |
+| `/check` | Force an immediate poll now |
+| `/status` | Show stats |
+| `/leave` | Remove all tracking data for a channel |
 
 ---
 
-## What Gets Posted
+## Useful Fly.io commands
 
-| Tweet type | Forwarded? |
-|---|---|
-| Original tweet | ✅ Yes |
-| Quote tweet | ✅ Yes |
-| Retweet / Repost | ❌ No |
-
----
-
-## Redis Key Schema
-
-```
-tw:channels                        — SET of all channel IDs
-tw:accounts:<channel_id>           — SET of tracked usernames per channel
-tw:seen:<channel_id>:<username>    — SET of already-posted tweet IDs
+```bash
+fly logs                  # stream live logs
+fly status                # check machine health
+fly secrets list          # list set secrets (values hidden)
+fly secrets set KEY=val   # add/update a secret
+fly deploy                # redeploy after code changes
+fly scale count 1         # ensure exactly 1 instance is running
 ```
 
 ---
 
-## Project Structure
+## Free tier limits
+
+- **Fly.io:** 3 shared-CPU VMs free, 256 MB RAM each — more than enough for this bot
+- **Upstash Redis:** 10,000 commands/day free, 256 MB storage
+- **RapidAPI:** 500 requests/month on the free plan
+
+With the default 5-minute poll interval and a handful of accounts, you'll stay well within all limits.
+
+---
+
+## Project structure
 
 ```
 twitterbot/
-├── bot.py            # Polling loop + multi-channel command handlers
+├── bot.py            # Polling loop + Telegram command handlers
 ├── config.py         # Env var loader
-├── storage.py        # Async Redis storage — multi-channel schema
+├── storage.py        # Async Redis storage (multi-channel)
 ├── requirements.txt
-├── render.yaml       # Render Blueprint (worker + Redis)
-├── runtime.txt       # Python 3.11
-├── .env.example
+├── Dockerfile        # Container build for Fly.io
+├── fly.toml          # Fly.io app config
+├── .env.example      # Local dev reference
 ├── .gitignore
 └── README.md
 ```
-
----
-
-## Troubleshooting
-
-**Bot doesn't receive commands in a channel**
-→ Make sure Privacy Mode is disabled: BotFather → `/setprivacy` → your bot → Disable.
-
-**Bot posts to the wrong channel / doesn't post at all**
-→ Confirm the bot is Admin with "Post Messages" in that channel. Run `/list` inside the channel to verify accounts are tracked there.
-
-**`REDIS_URL` not found on startup**
-→ You deployed as a plain Web Service instead of a Blueprint. Use **New → Blueprint** so Redis is provisioned and linked automatically.
-
-**Free tier limits**
-→ Render: 750 worker hours/month (enough for one always-on service), Redis: 25 MB cap.
-→ RapidAPI free tier: 500 req/month. With multiple channels × multiple accounts, increase `POLL_INTERVAL_SECONDS` or upgrade to the $10/mo RapidAPI tier.
