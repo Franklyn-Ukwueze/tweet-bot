@@ -26,7 +26,12 @@ class Config:
         self.telegram_token: str = self._require("TELEGRAM_BOT_TOKEN")
         self.rapidapi_key: str   = self._require("RAPIDAPI_KEY")
 
-        # Render injects REDIS_URL from the Blueprint Redis service automatically
+        # Tweet API (twitter-api47 on RapidAPI)
+        self.rapidapi_host: str        = "twitter-api47.p.rapidapi.com"
+        self.rapidapi_tweets_url: str  = "https://twitter-api47.p.rapidapi.com/v3/user/tweets"
+        self.rapidapi_profile_url: str = "https://twitter-api47.p.rapidapi.com/v3/user/by-username"
+
+        # Render injects REDIS_URL automatically via the Blueprint Redis service
         self.redis_url: str = (
             os.getenv("REDIS_URL")
             or os.getenv("REDIS_TLS_URL")
@@ -34,14 +39,11 @@ class Config:
             or "redis://localhost:6379"
         )
 
-        # Comma-separated Telegram user IDs allowed to run commands.
-        # Leave blank to allow anyone.
         raw = os.getenv("ADMIN_USER_IDS", "")
         self.admin_ids: list[int] = (
             [int(x.strip()) for x in raw.split(",") if x.strip()] if raw else []
         )
 
-        # How often to poll all channels (seconds). Default: 5 minutes.
         self.poll_interval: int = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 
     @staticmethod

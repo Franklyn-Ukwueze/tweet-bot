@@ -6,6 +6,7 @@ Key schema
 tw:channels                        SET   — all known channel IDs (strings)
 tw:accounts:<channel_id>           SET   — usernames tracked in that channel
 tw:seen:<channel_id>:<username>    SET   — tweet IDs already posted to that channel
+tw:userid:<username>               STR   — cached Twitter user ID for a username
 """
 
 import logging
@@ -16,7 +17,8 @@ logger = logging.getLogger(__name__)
 CHANNELS_KEY   = "tw:channels"
 ACCOUNTS_PFX   = "tw:accounts:"
 SEEN_PFX       = "tw:seen:"
-MAX_SEEN       = 500   # max tweet IDs stored per (channel, account) pair
+USERID_PFX     = "tw:userid:"
+MAX_SEEN       = 500
 
 
 class RedisStorage:
@@ -43,13 +45,10 @@ class RedisStorage:
         return list(await r.smembers(CHANNELS_KEY))
 
     async def register_channel(self, channel_id: str) -> bool:
-        """Add channel to the known set. Returns True if newly added."""
         r = await self._r()
-        added = await r.sadd(CHANNELS_KEY, str(channel_id))
-        return bool(added)
+        return bool(await r.sadd(CHANNELS_KEY, str(channel_id)))
 
     async def unregister_channel(self, channel_id: str) -> bool:
-        """Remove channel and all its data. Returns True if it existed."""
         r       = await self._r()
         cid     = str(channel_id)
         existed = await r.srem(CHANNELS_KEY, cid)
@@ -73,7 +72,7 @@ class RedisStorage:
         username = username.lower().lstrip("@")
         r        = await self._r()
         cid      = str(channel_id)
-        await r.sadd(CHANNELS_KEY, cid)          # ensure channel is registered
+        await r.sadd(CHANNELS_KEY, cid)
         added = await r.sadd(ACCOUNTS_PFX + cid, username)
         if added:
             logger.info("Channel %s: added @%s", cid, username)
@@ -88,6 +87,17 @@ class RedisStorage:
             await r.delete(f"{SEEN_PFX}{cid}:{username}")
             logger.info("Channel %s: removed @%s", cid, username)
         return bool(removed)
+
+    # ── user ID cache ─────────────────────────────────────────────────────────
+
+    async def get_user_id(self, username: str) -> str | None:
+        r = await self._r()
+        return await r.get(USERID_PFX + username.lower())
+
+    async def set_user_id(self, username: str, user_id: str):
+        r = await self._r()
+        await r.set(USERID_PFX + username.lower(), user_id)
+        logger.info("Cached user ID for @%s: %s", username, user_id)
 
     # ── seen tweets (per channel + account) ──────────────────────────────────
 
@@ -123,8 +133,4 @@ class RedisStorage:
             s = await self.channel_stats(cid)
             total_accounts += s["accounts"]
             total_seen     += s["seen"]
-        return {
-            "channels": len(channels),
-            "accounts": total_accounts,
-            "seen":     total_seen,
-        }
+        return {"channels": len(channels), "accounts": total_accounts, "seen": total_seen}

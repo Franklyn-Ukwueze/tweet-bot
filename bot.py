@@ -1,9 +1,13 @@
 """
-Twitter → Telegram Bot  (Render + Redis, multi-channel edition)
+Twitter -> Telegram Bot  (Render + Redis, multi-channel edition)
 
 Each Telegram channel the bot is added to maintains its own independent list
 of tracked Twitter/X accounts. Only original tweets and quote tweets are posted;
 pure reposts are silently skipped.
+
+API: twitter-api47 on RapidAPI
+  - Resolve username -> userId once on /add, cached in Redis
+  - Poll tweets using userId + optional cursor
 """
 
 import asyncio
@@ -26,39 +30,82 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-#  Twitter helpers
+#  Twitter API helpers
 # ─────────────────────────────────────────────
 
-async def fetch_user_tweets(username: str, cfg: Config) -> list[dict]:
-    url = "https://twitter-api45.p.rapidapi.com/timeline.php"
-    headers = {
-        "x-rapidapi-key": cfg.rapidapi_key,
-        "x-rapidapi-host": "twitter-api45.p.rapidapi.com",
+def _api_headers(cfg: Config) -> dict:
+    return {
+        "x-rapidapi-key":  cfg.rapidapi_key,
+        "x-rapidapi-host": cfg.rapidapi_host,
     }
+
+
+async def resolve_user_id(username: str, cfg: Config) -> str | None:
+    """
+    Look up the Twitter user ID for a given username.
+    Returns the ID string, or None if the user wasn't found.
+    """
     async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.get(url, headers=headers, params={"screenname": username.lstrip("@")})
+        resp = await client.get(
+            cfg.rapidapi_profile_url,
+            headers=_api_headers(cfg),
+            params={"username": username.lstrip("@")},
+        )
         resp.raise_for_status()
-        return resp.json().get("timeline", [])
+        data = resp.json()
+
+    # Response shape may vary — handle common structures
+    # Shape A: { "id": "...", "username": "..." }
+    # Shape B: { "data": { "id": "...", "username": "..." } }
+    if isinstance(data, dict):
+        user = data.get("data", data)
+        uid = user.get("id") or user.get("userId") or user.get("rest_id")
+        if uid:
+            return str(uid)
+
+    logger.warning("Could not extract user ID from profile response for @%s: %s", username, data)
+    return None
+
+
+async def fetch_user_tweets(user_id: str, cfg: Config) -> list[dict]:
+    """
+    Fetch recent tweets for a user by their Twitter user ID.
+    Response shape: { "data": [ { "id", "type", "text", "author": {...} } ] }
+    """
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(
+            cfg.rapidapi_tweets_url,
+            headers=_api_headers(cfg),
+            params={"userId": user_id},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    return data.get("data", [])
 
 
 def is_original_or_quote(tweet: dict) -> bool:
-    is_retweet = tweet.get("retweeted_status") is not None
-    is_quote   = tweet.get("is_quote_status", False) or tweet.get("quoted_status") is not None
-    return not (is_retweet and not is_quote)
+    """type is one of: "tweet", "quote", "retweet". Skip pure retweets."""
+    return tweet.get("type") != "retweet"
 
 
 def tweet_id_of(tweet: dict) -> str:
-    return str(tweet.get("tweet_id") or tweet.get("id_str") or tweet.get("id", ""))
+    return str(tweet.get("id", ""))
 
 
-def format_message(username: str, tweet: dict) -> str:
-    tid     = tweet_id_of(tweet)
-    text    = tweet.get("text", "")
-    is_qt   = tweet.get("is_quote_status", False) or tweet.get("quoted_status") is not None
-    url     = f"https://x.com/{username.lstrip('@')}/status/{tid}"
-    label   = "💬 Quote Tweet" if is_qt else "🐦 New Tweet"
-    preview = text[:280] + ("…" if len(text) > 280 else "")
-    return f"{label} from <b>@{username.lstrip('@')}</b>\n\n{preview}\n\n🔗 {url}"
+def format_message(tweet: dict) -> str:
+    tid      = tweet_id_of(tweet)
+    text     = tweet.get("text", "")
+    ttype    = tweet.get("type", "tweet")
+    username = tweet.get("author", {}).get("username", "unknown")
+    url      = f"https://x.com/{username}/status/{tid}"
+    label    = "💬 Quote Tweet" if ttype == "quote" else "🐦 New Tweet"
+    preview  = text[:280] + ("…" if len(text) > 280 else "")
+    return (
+        f"{label} from <b>@{username}</b>\n\n"
+        f"{preview}\n\n"
+        f"🔗 {url}"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -68,8 +115,18 @@ def format_message(username: str, tweet: dict) -> str:
 async def poll_channel(bot: Bot, cfg: Config, storage: RedisStorage, channel_id: str):
     accounts = await storage.get_accounts(channel_id)
     for username in accounts:
+        # Resolve user ID (from cache or fresh lookup)
+        user_id = await storage.get_user_id(username)
+        if not user_id:
+            logger.info("No cached user ID for @%s, resolving...", username)
+            user_id = await resolve_user_id(username, cfg)
+            if not user_id:
+                logger.warning("Could not resolve user ID for @%s, skipping.", username)
+                continue
+            await storage.set_user_id(username, user_id)
+
         try:
-            tweets = await fetch_user_tweets(username, cfg)
+            tweets = await fetch_user_tweets(user_id, cfg)
         except Exception as exc:
             logger.warning("Channel %s — failed to fetch @%s: %s", channel_id, username, exc)
             continue
@@ -88,13 +145,13 @@ async def poll_channel(bot: Bot, cfg: Config, storage: RedisStorage, channel_id:
             try:
                 await bot.send_message(
                     chat_id=channel_id,
-                    text=format_message(username, tweet),
+                    text=format_message(tweet),
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=False,
                 )
                 new_count += 1
             except TelegramError as exc:
-                logger.error("Channel %s — Telegram error sending @%s/%s: %s",
+                logger.error("Channel %s — Telegram error @%s/%s: %s",
                              channel_id, username, tid, exc)
 
             await storage.mark_seen(channel_id, username, tid)
@@ -117,41 +174,23 @@ async def polling_loop(bot: Bot, cfg: Config, storage: RedisStorage):
 
 
 # ─────────────────────────────────────────────
-#  Helpers — resolve the target channel
+#  Helpers
 # ─────────────────────────────────────────────
 
 def get_channel_id(update: Update) -> str | None:
-    """
-    Commands can be sent in three ways:
-      1. Directly in the channel (chat.type == channel)
-      2. In a group/supergroup that is linked to a channel
-      3. In a private chat with the bot (admin managing the bot)
-
-    For cases 1 & 2 we use the chat ID directly.
-    For case 3 the admin must pass the channel ID: /add -1001234 @user
-    """
     chat = update.effective_chat
     if chat and chat.type in (Chat.CHANNEL, Chat.GROUP, Chat.SUPERGROUP):
         return str(chat.id)
-    return None   # private chat — caller must supply channel_id via argument
+    return None
 
 
 def parse_channel_and_users(args: list[str]) -> tuple[str | None, list[str]]:
-    """
-    Parse optional leading channel ID from command args.
-    /add @user1 @user2          → channel=None, users=['user1','user2']
-    /add -1001234567890 @user1  → channel='-1001234567890', users=['user1']
-    """
     if not args:
         return None, []
     if args[0].lstrip("-").isdigit():
         return args[0], [a.lstrip("@").lower() for a in args[1:]]
     return None, [a.lstrip("@").lower() for a in args]
 
-
-# ─────────────────────────────────────────────
-#  Admin check
-# ─────────────────────────────────────────────
 
 def is_admin(user_id: int, cfg: Config) -> bool:
     return not cfg.admin_ids or user_id in cfg.admin_ids
@@ -163,20 +202,17 @@ def is_admin(user_id: int, cfg: Config) -> bool:
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg: Config = ctx.bot_data["cfg"]
-    user_id = update.effective_user.id if update.effective_user else None
-    if not is_admin(user_id, cfg):
+    if not is_admin(update.effective_user.id, cfg):
         return
-
     await update.effective_message.reply_text(
         "👋 <b>Twitter Monitor Bot</b>\n\n"
         "<b>In a channel or group:</b>\n"
         "/add @username — track an account in this channel\n"
         "/remove @username — stop tracking\n"
-        "/list — show tracked accounts for this channel\n"
+        "/list — show tracked accounts\n"
         "/check — check for new tweets now\n"
-        "/status — show this channel's stats\n\n"
-        "<b>From a private chat (manage any channel):</b>\n"
-        "Prefix commands with the channel ID:\n"
+        "/status — show stats\n\n"
+        "<b>From private chat (manage any channel):</b>\n"
         "<code>/add -1001234567890 @username</code>\n"
         "<code>/list -1001234567890</code>",
         parse_mode=ParseMode.HTML,
@@ -186,8 +222,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg: Config           = ctx.bot_data["cfg"]
     storage: RedisStorage = ctx.bot_data["storage"]
-    user_id = update.effective_user.id if update.effective_user else None
-    if not is_admin(user_id, cfg):
+    if not is_admin(update.effective_user.id, cfg):
         await update.effective_message.reply_text("⛔ Not authorised.")
         return
 
@@ -197,8 +232,7 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not channel_id:
         await update.effective_message.reply_text(
-            "Usage from private chat: /add <channel_id> @username\n"
-            "Example: <code>/add -1001234567890 @elonmusk</code>",
+            "Usage from private chat:\n<code>/add -1001234567890 @username</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -206,26 +240,46 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Please provide at least one @username.")
         return
 
-    added, already = [], []
+    await update.effective_message.reply_text("🔍 Resolving account(s)…")
+
+    added, already, failed = [], [], []
     for username in usernames:
-        if await storage.add_account(channel_id, username):
-            added.append(f"@{username}")
-        else:
+        # Check if already tracked in this channel
+        existing = await storage.get_accounts(channel_id)
+        if username in existing:
             already.append(f"@{username}")
+            continue
+
+        # Resolve user ID (use cache if available from another channel)
+        user_id = await storage.get_user_id(username)
+        if not user_id:
+            try:
+                user_id = await resolve_user_id(username, cfg)
+            except Exception as exc:
+                logger.warning("Failed to resolve @%s: %s", username, exc)
+
+        if not user_id:
+            failed.append(f"@{username}")
+            continue
+
+        await storage.set_user_id(username, user_id)
+        await storage.add_account(channel_id, username)
+        added.append(f"@{username}")
 
     parts = []
     if added:
         parts.append(f"✅ Now tracking in <code>{channel_id}</code>: {', '.join(added)}")
     if already:
         parts.append(f"ℹ️ Already tracked: {', '.join(already)}")
+    if failed:
+        parts.append(f"❌ Could not find: {', '.join(failed)} — check the username and try again")
     await update.effective_message.reply_text("\n".join(parts), parse_mode=ParseMode.HTML)
 
 
 async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg: Config           = ctx.bot_data["cfg"]
     storage: RedisStorage = ctx.bot_data["storage"]
-    user_id = update.effective_user.id if update.effective_user else None
-    if not is_admin(user_id, cfg):
+    if not is_admin(update.effective_user.id, cfg):
         await update.effective_message.reply_text("⛔ Not authorised.")
         return
 
@@ -235,7 +289,7 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not channel_id or not usernames:
         await update.effective_message.reply_text(
-            "Usage: /remove @username  (or /remove <channel_id> @username from private chat)"
+            "Usage: /remove @username  (or /remove <channel_id> @username)"
         )
         return
 
@@ -257,12 +311,10 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg: Config           = ctx.bot_data["cfg"]
     storage: RedisStorage = ctx.bot_data["storage"]
-    user_id = update.effective_user.id if update.effective_user else None
-    if not is_admin(user_id, cfg):
+    if not is_admin(update.effective_user.id, cfg):
         return
 
     channel_from_chat = get_channel_id(update)
-    # /list may be called with an optional channel ID from private chat
     channel_id = None
     if ctx.args and ctx.args[0].lstrip("-").isdigit():
         channel_id = ctx.args[0]
@@ -270,7 +322,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         channel_id = channel_from_chat
 
     if not channel_id:
-        # Private chat, no channel ID given — list all channels
+        # Private chat, no ID — list all channels
         channels = await storage.get_channels()
         if not channels:
             await update.effective_message.reply_text("No channels registered yet.")
@@ -303,8 +355,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg: Config           = ctx.bot_data["cfg"]
     storage: RedisStorage = ctx.bot_data["storage"]
-    user_id = update.effective_user.id if update.effective_user else None
-    if not is_admin(user_id, cfg):
+    if not is_admin(update.effective_user.id, cfg):
         return
 
     channel_from_chat = get_channel_id(update)
@@ -312,11 +363,12 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     channel_id  = channel_arg or channel_from_chat
 
     if channel_id:
-        await update.effective_message.reply_text(f"🔍 Checking <code>{channel_id}</code>…", parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text(
+            f"🔍 Checking <code>{channel_id}</code>…", parse_mode=ParseMode.HTML
+        )
         await poll_channel(ctx.bot, cfg, storage, channel_id)
         await update.effective_message.reply_text("✅ Done.")
     else:
-        # Private chat, no ID — check all channels
         channels = await storage.get_channels()
         await update.effective_message.reply_text(f"🔍 Checking {len(channels)} channel(s)…")
         for cid in channels:
@@ -327,8 +379,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cfg: Config           = ctx.bot_data["cfg"]
     storage: RedisStorage = ctx.bot_data["storage"]
-    user_id = update.effective_user.id if update.effective_user else None
-    if not is_admin(user_id, cfg):
+    if not is_admin(update.effective_user.id, cfg):
         return
 
     channel_from_chat = get_channel_id(update)
@@ -357,11 +408,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Remove all data for a channel (called by admin to clean up)."""
     cfg: Config           = ctx.bot_data["cfg"]
     storage: RedisStorage = ctx.bot_data["storage"]
-    user_id = update.effective_user.id if update.effective_user else None
-    if not is_admin(user_id, cfg):
+    if not is_admin(update.effective_user.id, cfg):
         return
 
     channel_from_chat = get_channel_id(update)
@@ -370,20 +419,18 @@ async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not channel_id:
         await update.effective_message.reply_text(
-            "Usage: /leave <channel_id>  — removes all tracking data for that channel."
+            "Usage: /leave <channel_id>"
         )
         return
 
     removed = await storage.unregister_channel(channel_id)
     if removed:
         await update.effective_message.reply_text(
-            f"🗑️ All data for <code>{channel_id}</code> has been removed.",
-            parse_mode=ParseMode.HTML,
+            f"🗑️ All data for <code>{channel_id}</code> removed.", parse_mode=ParseMode.HTML
         )
     else:
         await update.effective_message.reply_text(
-            f"❓ Channel <code>{channel_id}</code> was not registered.",
-            parse_mode=ParseMode.HTML,
+            f"❓ Channel <code>{channel_id}</code> was not registered.", parse_mode=ParseMode.HTML
         )
 
 
@@ -411,16 +458,14 @@ def main():
     app.bot_data["cfg"]     = cfg
     app.bot_data["storage"] = storage
 
-    # Accept commands from channels, groups, and private chats
-    any_chat = filters.ALL
-    app.add_handler(CommandHandler("start",  cmd_start,  filters=any_chat))
-    app.add_handler(CommandHandler("help",   cmd_start,  filters=any_chat))
-    app.add_handler(CommandHandler("add",    cmd_add,    filters=any_chat))
-    app.add_handler(CommandHandler("remove", cmd_remove, filters=any_chat))
-    app.add_handler(CommandHandler("list",   cmd_list,   filters=any_chat))
-    app.add_handler(CommandHandler("check",  cmd_check,  filters=any_chat))
-    app.add_handler(CommandHandler("status", cmd_status, filters=any_chat))
-    app.add_handler(CommandHandler("leave",  cmd_leave,  filters=any_chat))
+    app.add_handler(CommandHandler("start",  cmd_start,  filters=filters.ALL))
+    app.add_handler(CommandHandler("help",   cmd_start,  filters=filters.ALL))
+    app.add_handler(CommandHandler("add",    cmd_add,    filters=filters.ALL))
+    app.add_handler(CommandHandler("remove", cmd_remove, filters=filters.ALL))
+    app.add_handler(CommandHandler("list",   cmd_list,   filters=filters.ALL))
+    app.add_handler(CommandHandler("check",  cmd_check,  filters=filters.ALL))
+    app.add_handler(CommandHandler("status", cmd_status, filters=filters.ALL))
+    app.add_handler(CommandHandler("leave",  cmd_leave,  filters=filters.ALL))
 
     logger.info("Bot starting (multi-channel mode)…")
     app.run_polling(drop_pending_updates=True)
