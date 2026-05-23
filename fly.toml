@@ -1,7 +1,6 @@
 # fly.toml
-# Replace "your-app-name" with your actual app name (must be globally unique on Fly.io)
 
-app = "BeerusTweetBot"
+app = "beerus_tweet_bot"
 primary_region = "lhr"  # London — change to your nearest region if preferred
                          # Other options: iad (Virginia), sin (Singapore), syd (Sydney)
                          # nrt (Tokyo), fra (Frankfurt), cdg (Paris)
