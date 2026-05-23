@@ -1,6 +1,6 @@
 # fly.toml
 
-app = "beerus_tweet_bot"
+app = "beerus-tweet-bot"
 primary_region = "lhr"  # London — change to your nearest region if preferred
                          # Other options: iad (Virginia), sin (Singapore), syd (Sydney)
                          # nrt (Tokyo), fra (Frankfurt), cdg (Paris)
